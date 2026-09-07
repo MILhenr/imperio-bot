@@ -143,7 +143,10 @@ def process_video(video_path, calib_points, frame_scale, progress_cb=None):
     sejam pelo menos 4 e não estejam todos em linha reta."""
     model = get_model()
 
-    src_pts = np.array([[p["x"], p["y"]] for p in calib_points], dtype=np.float32)
+    # os pontos foram marcados na imagem REDUZIDA (mostrada no navegador), mas
+    # a detecção roda no vídeo em resolução ORIGINAL — precisa escalar de volta
+    inv_scale = 1.0 / frame_scale if frame_scale else 1.0
+    src_pts = np.array([[p["x"] * inv_scale, p["y"] * inv_scale] for p in calib_points], dtype=np.float32)
     dst_pts = np.array([[p["fx"], p["fy"]] for p in calib_points], dtype=np.float32)
     method = cv2.RANSAC if len(calib_points) > 4 else 0
     H, _ = cv2.findHomography(src_pts, dst_pts, method)
@@ -154,36 +157,65 @@ def process_video(video_path, calib_points, frame_scale, progress_cb=None):
     cap = cv2.VideoCapture(video_path)
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30
     sample_every = max(1, round(src_fps / 6))
-    cap.release()
 
-    # ultralytics cuida do rastreamento (ByteTrack) frame a frame
-    track_results = model.track(
-        source=video_path, classes=[0], persist=True, tracker="bytetrack.yaml",
-        vid_stride=sample_every, conf=0.25, verbose=False, stream=True
-    )
-
-    tracks = {}  # track_id -> lista de {frame_idx, cx, cy_foot}
+    # detecção direta por frame + rastreamento simples (vizinho mais próximo
+    # entre frames) — evita o atraso de "confirmação" do ByteTrack, que em
+    # vídeos curtos às vezes nunca chega a confirmar nenhum jogador
+    tracks = {}  # track_id -> lista de {frame_idx, px, py, color}
+    active = {}  # track_id -> (px, py)
+    next_id = 0
     frame_idx = 0
-    total_estimate = 60
-    for r in track_results:
+    raw_idx = 0
+    total_estimate = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 60) // sample_every)
+
+    while True:
+        ok, frame_img = cap.read()
+        if not ok:
+            break
+        raw_idx += 1
+        if (raw_idx - 1) % sample_every != 0:
+            continue
         frame_idx += 1
         if progress_cb: progress_cb(min(90, int(frame_idx / total_estimate * 70)))
-        if r.boxes is None or r.boxes.id is None:
-            continue
-        frame_img = r.orig_img
-        for box, tid in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.id.cpu().numpy()):
-            x1, y1, x2, y2 = box
-            tid = int(tid)
-            foot_x, foot_y = (x1 + x2) / 2, y2  # base da caixa = pés
-            jersey_color = sample_jersey_color(frame_img, x1, y1, x2, y2)
-            tracks.setdefault(tid, []).append({
-                "frame": frame_idx, "px": foot_x, "py": foot_y, "color": jersey_color
-            })
 
+        results = model.predict(frame_img, classes=[0], conf=0.25, verbose=False)
+        dets = []
+        if results and results[0].boxes is not None:
+            for box in results[0].boxes.xyxy.cpu().numpy():
+                x1, y1, x2, y2 = box
+                foot_x, foot_y = (x1 + x2) / 2, y2
+                color = sample_jersey_color(frame_img, x1, y1, x2, y2)
+                dets.append({"px": foot_x, "py": foot_y, "color": color})
+
+        used = set()
+        new_active = {}
+        for tid, (ax, ay) in active.items():
+            best_j, best_dist = None, 90  # limite de distância em pixels entre frames
+            for j, d in enumerate(dets):
+                if j in used:
+                    continue
+                dist = ((d["px"] - ax) ** 2 + (d["py"] - ay) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best_j = j
+            if best_j is not None:
+                used.add(best_j)
+                d = dets[best_j]
+                tracks[tid].append({"frame": frame_idx, "px": d["px"], "py": d["py"], "color": d["color"]})
+                new_active[tid] = (d["px"], d["py"])
+        for j, d in enumerate(dets):
+            if j in used:
+                continue
+            tid = next_id; next_id += 1
+            tracks[tid] = [{"frame": frame_idx, "px": d["px"], "py": d["py"], "color": d["color"]}]
+            new_active[tid] = (d["px"], d["py"])
+        active = new_active
+
+    cap.release()
     if progress_cb: progress_cb(92)
 
     # descarta rastros muito curtos (ruído)
-    tracks = {tid: pts for tid, pts in tracks.items() if len(pts) >= 3}
+    tracks = {tid: pts for tid, pts in tracks.items() if len(pts) >= 2}
     if not tracks:
         raise RuntimeError("Não detectei jogadores com confiança nesse vídeo.")
 
