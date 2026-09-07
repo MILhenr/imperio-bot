@@ -83,19 +83,20 @@ async def upload_video(file: UploadFile = File(...)):
 
 @app.post("/process/{job_id}")
 def start_processing(job_id: str, corners: str = Form(...)):
-    """Recebe os 4 cantos marcados (em pixels do frame reduzido) e dispara o
-    processamento em segundo plano. corners = JSON string com 4 pontos
-    [{x,y}, ...] na ordem: canto1(perto do gol A, lado esquerdo), canto2(perto
-    do gol A, lado direito), canto3(perto do gol B, lado direito), canto4(perto
-    do gol B, lado esquerdo) — ou seja, andando ao redor da quadra."""
+    """Recebe os pontos de calibração marcados: cada um tem {x,y} (pixel no
+    frame reduzido) e {fx,fy} (posição real na quadra, fração 0..1) — pode
+    ser qualquer combinação de referências conhecidas da quadra, não só os 4
+    cantos externos. Mínimo de 4 pontos."""
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "Job não encontrado (ou expirou).")
     try:
         pts = json.loads(corners)
-        assert len(pts) == 4
+        assert len(pts) >= 4
+        for p in pts:
+            assert "x" in p and "y" in p and "fx" in p and "fy" in p
     except Exception:
-        raise HTTPException(400, "Formato de cantos inválido — precisa de 4 pontos {x,y}.")
+        raise HTTPException(400, "Formato de pontos inválido — precisa de pelo menos 4 pontos {x,y,fx,fy}.")
 
     job["status"] = "processing"
     job["progress"] = 0
@@ -134,12 +135,20 @@ def _run_pipeline(job_id, corner_pts):
 # (ByteTrack via ultralytics), separa times por cor de uniforme, converte pra
 # coordenada da quadra (homografia dos 4 cantos), gera o JSON no formato do app.
 # ---------------------------------------------------------------------------
-def process_video(video_path, corner_pts, frame_scale, progress_cb=None):
+def process_video(video_path, calib_points, frame_scale, progress_cb=None):
+    """calib_points: lista de {x, y, fx, fy} — x,y = pixel no frame reduzido;
+    fx,fy = posição real na quadra (fração 0..1) que esse ponto representa.
+    Não precisa ser os 4 cantos — pode ser qualquer combinação de pontos
+    conhecidos (trave, marca de pênalti, centro do círculo, etc), desde que
+    sejam pelo menos 4 e não estejam todos em linha reta."""
     model = get_model()
 
-    src_pts = np.array([[p["x"], p["y"]] for p in corner_pts], dtype=np.float32)
-    dst_pts = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float32)
-    H, _ = cv2.findHomography(src_pts, dst_pts)
+    src_pts = np.array([[p["x"], p["y"]] for p in calib_points], dtype=np.float32)
+    dst_pts = np.array([[p["fx"], p["fy"]] for p in calib_points], dtype=np.float32)
+    method = cv2.RANSAC if len(calib_points) > 4 else 0
+    H, _ = cv2.findHomography(src_pts, dst_pts, method)
+    if H is None:
+        raise RuntimeError("Não consegui calcular a posição da quadra com esses pontos. Tenta marcar pontos mais espalhados (não todos numa linha reta).")
 
     # amostra a 6 fps pra não pesar demais (lance de até 10s -> até 60 frames)
     cap = cv2.VideoCapture(video_path)
